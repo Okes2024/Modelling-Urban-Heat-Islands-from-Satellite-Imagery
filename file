@@ -1,0 +1,270 @@
+# Modelling-Urban-Heat-Islands-from-Satellite-Imagery (Synthetic)
+# ---------------------------------------------------------------
+# Generates synthetic "satellite" features (bands & indices), simulates LST with UHI effects,
+# trains ML models, evaluates them, and visualizes actual vs. predicted heat maps.
+#
+# How to run:
+#   python uhi_synthetic_model.py
+#
+# Outputs (in ./outputs):
+#   - synthetic_uhi_dataset.csv
+#   - heatmap_true.png, heatmap_pred.png, heatmap_error.png
+#   - scatter_actual_vs_pred.png
+#   - permutation_importance.png
+#   - partial_dependence_<feature>.png (for top 3 features)
+
+import os
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.inspection import permutation_importance, PartialDependenceDisplay
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+# -----------------------------
+# 1) Config & Reproducibility
+# -----------------------------
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+OUT_DIR = "outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Grid size (points = rows * cols); ensure > 200
+GRID_ROWS, GRID_COLS = 40, 40   # 1600 points
+N = GRID_ROWS * GRID_COLS
+
+# ---------------------------------------
+# 2) Synthetic "Satellite" Data Generator
+# ---------------------------------------
+def generate_synthetic_satellite_data(rows=GRID_ROWS, cols=GRID_COLS, seed=RANDOM_SEED):
+    rng = np.random.default_rng(seed)
+    # Spatial grid (normalized coords ~ 0..1)
+    x = np.linspace(0, 1, cols)
+    y = np.linspace(0, 1, rows)
+    xx, yy = np.meshgrid(x, y)
+
+    # Simulate topography (gentle slope + hills)
+    elevation = (0.2 * yy + 0.1 * np.sin(2 * np.pi * xx) * np.cos(2 * np.pi * yy))
+    elevation = (elevation - elevation.min()) / (elevation.max() - elevation.min())
+
+    # Urban form proxy: distance to 2 urban centers (hotspots)
+    centers = np.array([[0.45, 0.55], [0.75, 0.3]])
+    def rbf(cx, cy, scale):
+        return np.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * (scale ** 2))))
+    urban_density = 0.9 * rbf(centers[0,0], centers[0,1], 0.12) + 0.7 * rbf(centers[1,0], centers[1,1], 0.1)
+    urban_density += 0.05 * rng.normal(size=urban_density.shape)
+    urban_density = np.clip((urban_density - urban_density.min()) / (urban_density.max() - urban_density.min()), 0, 1)
+
+    # Water body mask (a meandering river-like feature)
+    river = 0.15 * np.sin(4 * np.pi * xx) + 0.5
+    water_mask = (np.abs(yy - river) < 0.02).astype(float)
+
+    # Vegetation density (inverse of urban, influenced by elevation & water proximity)
+    veg_base = 0.7 * (1 - urban_density) + 0.2 * (1 - elevation) + 0.3 * (water_mask > 0)
+    veg_base += 0.05 * rng.normal(size=veg_base.shape)
+    vegetation = np.clip((veg_base - veg_base.min()) / (veg_base.max() - veg_base.min()), 0, 1)
+
+    # "Reflectance" bands (scaled 0..1) influenced by vegetation, urban, water
+    eps = 1e-6
+    BLUE  = np.clip(0.2 + 0.2 * water_mask + 0.1 * rng.normal(size=(rows, cols)), 0, 1)
+    GREEN = np.clip(0.25 + 0.5 * vegetation - 0.2 * urban_density + 0.1 * rng.normal(size=(rows, cols)), 0, 1)
+    RED   = np.clip(0.3 + 0.2 * urban_density - 0.3 * vegetation + 0.1 * rng.normal(size=(rows, cols)), 0, 1)
+    NIR   = np.clip(0.35 + 0.5 * vegetation - 0.15 * urban_density + 0.1 * rng.normal(size=(rows, cols)), 0, 1)
+    SWIR  = np.clip(0.4 + 0.4 * urban_density - 0.2 * vegetation + 0.1 * rng.normal(size=(rows, cols)), 0, 1)
+    TIRBT = np.clip(0.6 + 0.25 * urban_density - 0.1 * vegetation + 0.05 * rng.normal(size=(rows, cols)), 0, 1)
+
+    # Spectral indices
+    NDVI = (NIR - RED) / (NIR + RED + eps)
+    NDBI = (SWIR - NIR) / (SWIR + NIR + eps)
+    NDWI = (GREEN - NIR) / (GREEN + NIR + eps)
+
+    # Broadband albedo approximation (simple weighted mix of bands)
+    albedo = np.clip(0.1*BLUE + 0.3*GREEN + 0.3*RED + 0.2*NIR + 0.1*SWIR, 0, 1)
+
+    # Distance to water (smoothed)
+    from scipy.ndimage import distance_transform_edt
+    dist_to_water = distance_transform_edt(1 - water_mask) / max(rows, cols)
+    dist_to_center = np.minimum(
+        np.sqrt((xx - centers[0,0])**2 + (yy - centers[0,1])**2),
+        np.sqrt((xx - centers[1,0])**2 + (yy - centers[1,1])**2),
+    )
+
+    # Seasonality/day-of-year factor (uniform for the scene here)
+    doy = rng.integers(1, 366)
+    seasonal = 0.5 + 0.4 * math.sin(2 * math.pi * (doy / 365.0 - 0.25))  # peak near DOY ~ 90
+
+    # --------------------------
+    # 3) Simulate "True" LST (°C)
+    # --------------------------
+    # Base LST shaped by seasonality & elevation lapse rate
+    base_lst = 26 + 10 * seasonal - 3.0 * elevation
+
+    # UHI: hotter with urban_density & NDBI; cooler with NDVI, NDWI, albedo, water proximity
+    lst = (
+        base_lst
+        + 8.0 * urban_density
+        + 5.0 * NDBI
+        - 7.0 * NDVI
+        - 3.5 * NDWI
+        - 2.5 * albedo
+        - 4.0 * np.exp(-dist_to_water / 0.02)  # strong cooling near water
+        + 1.5 * TIRBT
+        + 2.0 * np.exp(-dist_to_center / 0.08)  # hotspot near city centers
+        + rng.normal(0, 0.8, size=(rows, cols))  # measurement noise
+    )
+
+    # Flatten to a DataFrame
+    df = pd.DataFrame({
+        "x": xx.ravel(),
+        "y": yy.ravel(),
+        "elevation": elevation.ravel(),
+        "urban_density": urban_density.ravel(),
+        "water_mask": water_mask.ravel(),
+        "BLUE": BLUE.ravel(),
+        "GREEN": GREEN.ravel(),
+        "RED": RED.ravel(),
+        "NIR": NIR.ravel(),
+        "SWIR": SWIR.ravel(),
+        "TIRBT": TIRBT.ravel(),
+        "NDVI": NDVI.ravel(),
+        "NDBI": NDBI.ravel(),
+        "NDWI": NDWI.ravel(),
+        "albedo": albedo.ravel(),
+        "dist_to_water": dist_to_water.ravel(),
+        "dist_to_center": dist_to_center.ravel(),
+        "LST": lst.ravel(),  # target in °C (approx)
+    })
+    meta = {"rows": rows, "cols": cols, "doy": int(doy)}
+    return df, meta
+
+# Generate dataset
+df, meta = generate_synthetic_satellite_data()
+print(f"Synthetic samples: {len(df)}  |  DOY used: {meta['doy']}")
+
+# Save dataset for inspection
+csv_path = os.path.join(OUT_DIR, "synthetic_uhi_dataset.csv")
+df.to_csv(csv_path, index=False)
+print(f"Saved dataset to {csv_path}")
+
+# -----------------------------
+# 4) Train/Test & Model Fitting
+# -----------------------------
+FEATURES = [
+    "x","y","elevation","urban_density","water_mask",
+    "BLUE","GREEN","RED","NIR","SWIR","TIRBT",
+    "NDVI","NDBI","NDWI","albedo","dist_to_water","dist_to_center"
+]
+TARGET = "LST"
+
+X = df[FEATURES].values
+y = df[TARGET].values
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=RANDOM_SEED
+)
+
+# Baseline linear model (with scaling)
+lin_pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("linreg", LinearRegression())
+])
+lin_pipe.fit(X_train, y_train)
+y_pred_lin = lin_pipe.predict(X_test)
+
+# Nonlinear model
+rf = RandomForestRegressor(
+    n_estimators=400,
+    max_depth=None,
+    min_samples_leaf=1,
+    random_state=RANDOM_SEED,
+    n_jobs=-1
+)
+rf.fit(X_train, y_train)
+y_pred_rf = rf.predict(X_test)
+
+def eval_and_print(name, y_true, y_pred):
+    r2  = r2_score(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = mean_squared_error(y_true, y_pred, squared=False)
+    print(f"{name:>12} | R2={r2:0.3f}  MAE={mae:0.3f}  RMSE={rmse:0.3f}")
+    return r2, mae, rmse
+
+print("\nPerformance on Test Set:")
+eval_and_print("LinearReg", y_test, y_pred_lin)
+eval_and_print("RandomForest", y_test, y_pred_rf)
+
+# -----------------------------
+# 5) Visualizations & Exports
+# -----------------------------
+def plot_heatmap(Z, title, path):
+    plt.figure(figsize=(6,5))
+    im = plt.imshow(Z.reshape(GRID_ROWS, GRID_COLS), origin="lower")
+    plt.title(title)
+    plt.colorbar(im, shrink=0.8, label="°C")
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+# Heatmaps: True, Predicted (RF), Error
+y_true_grid = y.reshape(GRID_ROWS, GRID_COLS)
+y_pred_grid = rf.predict(df[FEATURES].values).reshape(GRID_ROWS, GRID_COLS)
+err_grid = (y_pred_grid - y_true_grid)
+
+plot_heatmap(y_true_grid, "True LST (°C)", os.path.join(OUT_DIR, "heatmap_true.png"))
+plot_heatmap(y_pred_grid, "Predicted LST (°C) - RandomForest", os.path.join(OUT_DIR, "heatmap_pred.png"))
+plot_heatmap(err_grid, "Prediction Error (°C) - RandomForest", os.path.join(OUT_DIR, "heatmap_error.png"))
+
+# Scatter: Actual vs Predicted (test set)
+plt.figure(figsize=(5.5,5))
+plt.scatter(y_test, y_pred_rf, s=10, alpha=0.6)
+mn, mx = min(y_test.min(), y_pred_rf.min()), max(y_test.max(), y_pred_rf.max())
+plt.plot([mn, mx], [mn, mx])
+plt.xlabel("Actual LST (°C)")
+plt.ylabel("Predicted LST (°C)")
+plt.title("Actual vs Predicted (RandomForest)")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "scatter_actual_vs_pred.png"), dpi=200)
+plt.close()
+
+# Permutation importance
+perm = permutation_importance(rf, X_test, y_test, n_repeats=10, random_state=RANDOM_SEED, n_jobs=-1)
+importances = pd.DataFrame({
+    "feature": FEATURES,
+    "importance_mean": perm.importances_mean,
+    "importance_std": perm.importances_std
+}).sort_values("importance_mean", ascending=False)
+
+plt.figure(figsize=(7,6))
+plt.barh(importances["feature"][::-1], importances["importance_mean"][::-1])
+plt.xlabel("Permutation Importance (mean decrease in R2)")
+plt.title("Feature Importance (RandomForest)")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "permutation_importance.png"), dpi=200)
+plt.close()
+
+print("\nTop 10 important features:")
+print(importances.head(10).to_string(index=False))
+
+# Partial Dependence for top 3 features
+top3 = importances["feature"].head(3).tolist()
+for f in top3:
+    fig = plt.figure(figsize=(5.5,4.5))
+    try:
+        PartialDependenceDisplay.from_estimator(
+            rf, df[FEATURES], [f], grid_resolution=50
+        )
+        plt.title(f"Partial Dependence: {f}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUT_DIR, f"partial_dependence_{f}.png"), dpi=200)
+        plt.close()
+    except Exception as e:
+        plt.close()
+        print(f"Could not plot partial dependence for {f}: {e}")
+
+print(f"\nDone. Check '{OUT_DIR}' for outputs.")
